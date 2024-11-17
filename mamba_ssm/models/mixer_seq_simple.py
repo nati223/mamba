@@ -307,3 +307,152 @@ class MambaLMHeadModel(nn.Module, GenerationMixin):
         config_path = os.path.join(save_directory, 'config.json')
         with open(config_path, 'w') as f:
             json.dump(self.config.__dict__, f, indent=4)
+
+class MixedEmbedding(nn.Module):
+    def __init__(self, float_len, vocab_size, d_model, **factory_kwargs):
+        super(MixedEmbedding, self).__init__()
+        self.float_len = float_len  # Number of float tokens at the beginning
+        self.d_model = d_model
+        self.vocab_size = vocab_size
+        # Embedding layer for floats: processes each float individually
+        self.float_embed = nn.Linear(1, d_model)
+        # Embedding layer for integers
+        self.int_embed = nn.Embedding(vocab_size, d_model, **factory_kwargs)
+        self.token_type_embed = nn.Embedding(2, d_model)
+
+
+    def forward(self, input_sequence):
+        # input_sequence: [batch_size, seq_len, 1]
+        
+        # Remove the last dimension if there are 3 or more dimensions
+        if input_sequence.dim() > 2:
+            input_sequence = input_sequence.squeeze(-1)  # [batch_size, seq_len]
+
+        # Split into float_tokens and int_tokens
+        float_tokens = input_sequence[:, :self.float_len]  # [batch_size, float_len]
+        int_tokens = input_sequence[:, self.float_len:]    # [batch_size, seq_len - float_len]
+
+        # Process float tokens
+        float_tokens = input_sequence[:, :self.float_len].unsqueeze(-1).float()
+        float_embeddings = self.float_embed(float_tokens)
+        float_type_ids = torch.zeros(float_embeddings.size(0), float_embeddings.size(1), dtype=torch.long, device=input_sequence.device)
+        float_type_embeddings = self.token_type_embed(float_type_ids)
+        float_embeddings += float_type_embeddings
+        
+        # Process integer tokens
+        int_tokens = input_sequence[:, self.float_len:].long()
+        int_embeddings = self.int_embed(int_tokens)
+        int_type_ids = torch.ones(int_embeddings.size(0), int_embeddings.size(1), dtype=torch.long, device=input_sequence.device)
+        int_type_embeddings = self.token_type_embed(int_type_ids)
+        int_embeddings += int_type_embeddings
+        
+        # Concatenate the float and integer embeddings along the sequence dimension
+        embeddings = torch.cat([float_embeddings, int_embeddings], dim=1)  # [batch_size, seq_len, d_model]
+        # input_sequence = input_sequence.float()
+        
+        # # If the input sequence type is not float, normalize it and convert it to float
+        # if input_sequence.dtype != torch.float32:
+        #     input_sequence = input_sequence.float()
+        #     input_sequence = (input_sequence) / (self.vocab_size - 1)
+        # if (input_sequence.dim() < 3):
+        #     input_sequence = input_sequence.unsqueeze(-1)
+        
+        # embeddings = self.float_embed(input_sequence)
+        return embeddings
+
+
+class MetaMixerModel(MixerModel):
+    def __init__(
+        self,
+        d_model: int,
+        n_layer: int,
+        d_intermediate: int,
+        vocab_size: int,
+        ssm_cfg=None,
+        attn_layer_idx=None,
+        attn_cfg=None,
+        norm_epsilon: float = 1e-5,
+        rms_norm: bool = False,
+        initializer_cfg=None,
+        fused_add_norm=False,
+        residual_in_fp32=False,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__(
+            d_model,
+            n_layer,
+            d_intermediate,
+            vocab_size,
+            ssm_cfg,
+            attn_layer_idx,
+            attn_cfg,
+            norm_epsilon,
+            rms_norm,
+            initializer_cfg,
+            fused_add_norm,
+            residual_in_fp32,
+            device,
+            dtype,
+        )
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.embedding = MixedEmbedding(float_len=3, vocab_size=vocab_size, d_model=d_model, **factory_kwargs)
+        # self.embedding = nn.Linear(1, d_model, **factory_kwargs)
+
+class MetaMambaLMHeadModel(MambaLMHeadModel):
+    def tie_weights(self):
+        if self.config.tie_embeddings:
+            if hasattr(self.backbone.embedding, 'int_embed'):
+                # After overriding self.backbone with MetaMixerModel
+                self.lm_head.weight = self.backbone.embedding.int_embed.weight
+            else:
+                # During the initial call in super().__init__()
+                self.lm_head.weight = self.backbone.embedding.weight
+                
+    def __init__(
+        self,
+        config: MambaConfig,
+        initializer_cfg=None,
+        device=None,
+        dtype=None,
+    ) -> None:
+        super().__init__(config, initializer_cfg=initializer_cfg, device=device, dtype=dtype)
+        
+        # Adjust vocab_size if necessary
+        vocab_size = config.vocab_size
+        if vocab_size % config.pad_vocab_size_multiple != 0:
+            vocab_size += config.pad_vocab_size_multiple - (vocab_size % config.pad_vocab_size_multiple)
+        
+        # Override the backbone with MetaMixerModel using MixedEmbedding
+        self.backbone = MetaMixerModel(
+            d_model=config.d_model,
+            n_layer=config.n_layer,
+            d_intermediate=config.d_intermediate,
+            vocab_size=vocab_size,
+            ssm_cfg=config.ssm_cfg,
+            attn_layer_idx=config.attn_layer_idx,
+            attn_cfg=config.attn_cfg,
+            # norm_epsilon=config.norm_epsilon,
+            rms_norm=config.rms_norm,
+            initializer_cfg=initializer_cfg,
+            fused_add_norm=config.fused_add_norm,
+            residual_in_fp32=config.residual_in_fp32,
+            device=device,
+            dtype=dtype,
+        )
+        
+        # Re-initialize the lm_head with the updated vocab_size
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.lm_head = nn.Linear(config.d_model, vocab_size, bias=False, **factory_kwargs)
+        
+        # Initialize weights
+        self.apply(
+            partial(
+                _init_weights,
+                n_layer=config.n_layer,
+                **(initializer_cfg if initializer_cfg is not None else {}),
+            )
+        )
+        
+        # Tie weights
+        self.tie_weights()

@@ -331,34 +331,31 @@ class MixedEmbedding(nn.Module):
         # Split into float_tokens and int_tokens
         float_tokens = input_sequence[:, :self.float_len]  # [batch_size, float_len]
         int_tokens = input_sequence[:, self.float_len:]    # [batch_size, seq_len - float_len]
+        
+        # Process integer tokens
+        int_tokens = int_tokens.long() - 3
+        # Validate integer token range
+        if not ((int_tokens >= 0).all() and (int_tokens < self.vocab_size).all()):
+            print("Invalid int_tokens:", int_tokens)
+            raise ValueError(f"int_tokens out of range for nn.Embedding: vocab_size={self.vocab_size}")
 
         # Process float tokens
-        float_tokens = input_sequence[:, :self.float_len].unsqueeze(-1).float()
+        float_tokens = float_tokens.unsqueeze(-1).float()
         float_embeddings = self.float_embed(float_tokens)
         float_type_ids = torch.zeros(float_embeddings.size(0), float_embeddings.size(1), dtype=torch.long, device=input_sequence.device)
         float_type_embeddings = self.token_type_embed(float_type_ids)
         float_embeddings += float_type_embeddings
-        
-        # Process integer tokens
-        int_tokens = input_sequence[:, self.float_len:].long()
+
         int_embeddings = self.int_embed(int_tokens)
         int_type_ids = torch.ones(int_embeddings.size(0), int_embeddings.size(1), dtype=torch.long, device=input_sequence.device)
         int_type_embeddings = self.token_type_embed(int_type_ids)
         int_embeddings += int_type_embeddings
-        
+
         # Concatenate the float and integer embeddings along the sequence dimension
         embeddings = torch.cat([float_embeddings, int_embeddings], dim=1)  # [batch_size, seq_len, d_model]
-        # input_sequence = input_sequence.float()
         
-        # # If the input sequence type is not float, normalize it and convert it to float
-        # if input_sequence.dtype != torch.float32:
-        #     input_sequence = input_sequence.float()
-        #     input_sequence = (input_sequence) / (self.vocab_size - 1)
-        # if (input_sequence.dim() < 3):
-        #     input_sequence = input_sequence.unsqueeze(-1)
-        
-        # embeddings = self.float_embed(input_sequence)
         return embeddings
+
 
 
 class MetaMixerModel(MixerModel):
